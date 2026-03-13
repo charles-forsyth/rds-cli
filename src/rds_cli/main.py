@@ -494,7 +494,11 @@ def cp(
                 tmp_name = tmp.name
 
             try:
-                s3.download_file(src_bucket, src_key, tmp_name)
+                dl_kwargs_s3: dict[str, Any] = {}
+                if transfer_config:
+                    dl_kwargs_s3["Config"] = transfer_config
+
+                s3.download_file(src_bucket, src_key, tmp_name, **dl_kwargs_s3)
                 gcs_bucket = gcs.bucket(dst_bucket)
                 blob = gcs_bucket.blob(final_key)
                 blob.upload_from_filename(tmp_name)
