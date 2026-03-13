@@ -69,16 +69,25 @@ def info(bucket: str = typer.Option(..., "--bucket", "-b", help="Bucket to check
 
 @app.command()
 def ls(
-    bucket: str = typer.Option(..., "--bucket", "-b", help="Bucket to list"),
+    bucket: Optional[str] = typer.Option(None, "--bucket", "-b", help="Bucket to list"),
     prefix: str = typer.Option("", "--prefix", "-p", help="Filter by prefix"),
 ):
-    """List objects in the bucket."""
+    """List objects in a bucket, or list all buckets if none is specified."""
     from .client import get_s3_client
     from .utils import format_size
     from botocore.exceptions import ClientError
 
     try:
         s3 = get_s3_client()
+        if not bucket:
+            console.print("Listing all available [bold cyan]buckets[/bold cyan]:")
+            response = s3.list_buckets()
+            buckets = response.get("Buckets", [])
+            for b in buckets:
+                console.print(f" - {b['Name']} (Created: {b['CreationDate']})")
+            console.print(f"\nFound [bold]{len(buckets)}[/bold] buckets.")
+            return
+
         console.print(
             f"Listing contents of: [bold cyan]{bucket}[/bold cyan] (Prefix: '{prefix}')"
         )
@@ -117,7 +126,7 @@ def upload(
         False, "--multipart", help="Force multipart upload for large files"
     ),
 ):
-    """Upload a file or folder to the bucket (with optional metadata)."""
+    """Upload a file or folder to the bucket (with optional metadata and multipart support)."""
     import boto3.s3.transfer
     from .client import get_s3_client
     from botocore.exceptions import ClientError
