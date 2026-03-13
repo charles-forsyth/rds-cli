@@ -317,20 +317,21 @@ def stat(
 @app.command()
 def cp(
     source: str = typer.Argument(
-        ..., help="Source path (local path or s3://bucket/key)"
+        ..., help="Source path (local path, s3://bucket/key, or gs://bucket/key)"
     ),
     destination: str = typer.Argument(
-        ..., help="Destination path (local path or s3://bucket/key)"
+        ..., help="Destination path (local path, s3://bucket/key, or gs://bucket/key)"
     ),
     recursive: bool = typer.Option(False, "--recursive", "-r", help="Copy recursively"),
     multipart: bool = typer.Option(
         False, "--multipart", help="Force multipart for large files"
     ),
 ):
-    """Copy files between local and CephRDS (acts like standard 'cp')."""
+    """Copy files between local, CephRDS (S3), and Google Cloud Storage (GCS)."""
     import boto3.s3.transfer
     from .client import get_s3_client
     from botocore.exceptions import ClientError
+    import tempfile
 
     s3 = get_s3_client()
 
@@ -340,21 +341,21 @@ def cp(
             multipart_threshold=5 * 1024 * 1024, multipart_chunksize=5 * 1024 * 1024
         )
 
-    # Helper to parse s3:// URLs
-    def parse_s3_url(url: str):
-        if not url.startswith("s3://"):
-            return None, None
-        parts = url[5:].split("/", 1)
-        bucket = parts[0]
-        key = parts[1] if len(parts) > 1 else ""
-        return bucket, key
+    def parse_url(url: str):
+        if url.startswith("s3://"):
+            parts = url[5:].split("/", 1)
+            return "s3", parts[0], parts[1] if len(parts) > 1 else ""
+        elif url.startswith("gs://"):
+            parts = url[5:].split("/", 1)
+            return "gs", parts[0], parts[1] if len(parts) > 1 else ""
+        return "local", None, url
 
-    src_bucket, src_key = parse_s3_url(source)
-    dst_bucket, dst_key = parse_s3_url(destination)
+    src_scheme, src_bucket, src_key = parse_url(source)
+    dst_scheme, dst_bucket, dst_key = parse_url(destination)
 
     try:
         # Case 1: Local to S3 (Upload)
-        if not src_bucket and dst_bucket:
+        if src_scheme == "local" and dst_scheme == "s3":
             if not os.path.exists(source):
                 console.print(
                     f"[red]Error: Local source '{source}' does not exist.[/red]"
@@ -403,7 +404,7 @@ def cp(
                 )
 
         # Case 2: S3 to Local (Download)
-        elif src_bucket and not dst_bucket:
+        elif src_scheme == "s3" and dst_scheme == "local":
             if not recursive:
                 final_dst = (
                     destination
@@ -448,7 +449,7 @@ def cp(
                 console.print(f"[green]Downloaded {count} files.[/green]")
 
         # Case 3: S3 to S3 (Server-side Copy)
-        elif src_bucket and dst_bucket:
+        elif src_scheme == "s3" and dst_scheme == "s3":
             if not recursive:
                 final_key = (
                     dst_key
@@ -469,13 +470,84 @@ def cp(
                     "[red]Recursive S3-to-S3 copy is not yet supported in this CLI.[/red]"
                 )
 
-        else:
-            console.print(
-                "[red]Invalid arguments. At least one path must be an s3:// URL.[/red]"
+        # Case 4: S3 to GCS (Cross-Cloud)
+        elif src_scheme == "s3" and dst_scheme == "gs":
+            from google.cloud import storage  # type: ignore
+
+            gcs = storage.Client()
+            if recursive:
+                console.print(
+                    "[red]Recursive cross-cloud copy is not supported yet.[/red]"
+                )
+                return
+
+            final_key = (
+                dst_key
+                if dst_key and not dst_key.endswith("/")
+                else f"{dst_key}{os.path.basename(src_key)}"
             )
+            console.print(
+                f"Streaming 's3://{src_bucket}/{src_key}' -> 'gs://{dst_bucket}/{final_key}'..."
+            )
+
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp_name = tmp.name
+
+            try:
+                s3.download_file(src_bucket, src_key, tmp_name)
+                gcs_bucket = gcs.bucket(dst_bucket)
+                blob = gcs_bucket.blob(final_key)
+                blob.upload_from_filename(tmp_name)
+                console.print("[green]Cross-cloud copy complete.[/green]")
+            finally:
+                if os.path.exists(tmp_name):
+                    os.remove(tmp_name)
+
+        # Case 5: GCS to S3 (Cross-Cloud)
+        elif src_scheme == "gs" and dst_scheme == "s3":
+            from google.cloud import storage  # type: ignore
+
+            gcs = storage.Client()
+            if recursive:
+                console.print(
+                    "[red]Recursive cross-cloud copy is not supported yet.[/red]"
+                )
+                return
+
+            final_key = (
+                dst_key
+                if dst_key and not dst_key.endswith("/")
+                else f"{dst_key}{os.path.basename(src_key)}"
+            )
+            console.print(
+                f"Streaming 'gs://{src_bucket}/{src_key}' -> 's3://{dst_bucket}/{final_key}'..."
+            )
+
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp_name = tmp.name
+
+            try:
+                gcs_bucket = gcs.bucket(src_bucket)
+                blob = gcs_bucket.blob(src_key)
+                blob.download_to_filename(tmp_name)
+
+                kwargs_s3: dict[str, Any] = {}
+                if transfer_config:
+                    kwargs_s3["Config"] = transfer_config
+
+                s3.upload_file(tmp_name, dst_bucket, final_key, **kwargs_s3)
+                console.print("[green]Cross-cloud copy complete.[/green]")
+            finally:
+                if os.path.exists(tmp_name):
+                    os.remove(tmp_name)
+
+        else:
+            console.print("[red]Invalid arguments or unsupported copy operation.[/red]")
 
     except ClientError as e:
         console.print(f"[red]Operation failed: {e}[/red]")
+    except Exception as e:
+        console.print(f"[red]Cross-cloud operation failed: {e}[/red]")
 
 
 @app.command()
