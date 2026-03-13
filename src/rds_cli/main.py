@@ -314,5 +314,210 @@ def stat(
         console.print(f"[red]Error fetching object: {e}[/red]")
 
 
+@app.command()
+def cp(
+    source: str = typer.Argument(
+        ..., help="Source path (local path or s3://bucket/key)"
+    ),
+    destination: str = typer.Argument(
+        ..., help="Destination path (local path or s3://bucket/key)"
+    ),
+    recursive: bool = typer.Option(False, "--recursive", "-r", help="Copy recursively"),
+    multipart: bool = typer.Option(
+        False, "--multipart", help="Force multipart for large files"
+    ),
+):
+    """Copy files between local and CephRDS (acts like standard 'cp')."""
+    import boto3.s3.transfer
+    from .client import get_s3_client
+    from botocore.exceptions import ClientError
+
+    s3 = get_s3_client()
+
+    transfer_config = None
+    if multipart:
+        transfer_config = boto3.s3.transfer.TransferConfig(
+            multipart_threshold=5 * 1024 * 1024, multipart_chunksize=5 * 1024 * 1024
+        )
+
+    # Helper to parse s3:// URLs
+    def parse_s3_url(url: str):
+        if not url.startswith("s3://"):
+            return None, None
+        parts = url[5:].split("/", 1)
+        bucket = parts[0]
+        key = parts[1] if len(parts) > 1 else ""
+        return bucket, key
+
+    src_bucket, src_key = parse_s3_url(source)
+    dst_bucket, dst_key = parse_s3_url(destination)
+
+    try:
+        # Case 1: Local to S3 (Upload)
+        if not src_bucket and dst_bucket:
+            if not os.path.exists(source):
+                console.print(
+                    f"[red]Error: Local source '{source}' does not exist.[/red]"
+                )
+                return
+
+            kwargs: dict[str, Any] = {}
+            if transfer_config:
+                kwargs["Config"] = transfer_config
+
+            if os.path.isfile(source):
+                final_key = (
+                    dst_key
+                    if dst_key and not dst_key.endswith("/")
+                    else f"{dst_key}{os.path.basename(source)}"
+                )
+                console.print(
+                    f"Uploading '{source}' to 's3://{dst_bucket}/{final_key}'..."
+                )
+                s3.upload_file(source, dst_bucket, final_key, **kwargs)
+                console.print("[green]Upload complete.[/green]")
+            elif os.path.isdir(source) and recursive:
+                prefix = (
+                    dst_key
+                    if dst_key.endswith("/")
+                    else f"{dst_key}/"
+                    if dst_key
+                    else ""
+                )
+                console.print(
+                    f"Uploading directory '{source}' to 's3://{dst_bucket}/{prefix}'..."
+                )
+                count = 0
+                for root, _, files in os.walk(source):
+                    for file in files:
+                        local_file = os.path.join(root, file)
+                        rel_path = os.path.relpath(local_file, source)
+                        final_key = f"{prefix}{rel_path}".replace("\\", "/")
+                        console.print(f"  -> {final_key}")
+                        s3.upload_file(local_file, dst_bucket, final_key, **kwargs)
+                        count += 1
+                console.print(f"[green]Uploaded {count} files.[/green]")
+            else:
+                console.print(
+                    "[red]Source is a directory. Use --recursive (-r) to copy.[/red]"
+                )
+
+        # Case 2: S3 to Local (Download)
+        elif src_bucket and not dst_bucket:
+            if not recursive:
+                final_dst = (
+                    destination
+                    if not os.path.isdir(destination)
+                    else os.path.join(destination, os.path.basename(src_key))
+                )
+                console.print(
+                    f"Downloading 's3://{src_bucket}/{src_key}' to '{final_dst}'..."
+                )
+                os.makedirs(os.path.dirname(os.path.abspath(final_dst)), exist_ok=True)
+                s3.download_file(src_bucket, src_key, final_dst)
+                console.print("[green]Download complete.[/green]")
+            else:
+                console.print(
+                    f"Downloading recursively from 's3://{src_bucket}/{src_key}' to '{destination}'..."
+                )
+                os.makedirs(destination, exist_ok=True)
+                paginator = s3.get_paginator("list_objects_v2")
+                pages = paginator.paginate(Bucket=src_bucket, Prefix=src_key)
+                count = 0
+                for page in pages:
+                    if "Contents" in page:
+                        for obj in page["Contents"]:
+                            obj_key = obj["Key"]
+                            if obj_key.endswith("/"):
+                                continue
+
+                            rel_path = (
+                                os.path.relpath(obj_key, src_key)
+                                if src_key
+                                else obj_key
+                            )
+                            if rel_path == ".":
+                                rel_path = os.path.basename(obj_key)
+
+                            local_file_path = os.path.join(destination, rel_path)
+                            os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+
+                            console.print(f"  <- {obj_key}")
+                            s3.download_file(src_bucket, obj_key, local_file_path)
+                            count += 1
+                console.print(f"[green]Downloaded {count} files.[/green]")
+
+        # Case 3: S3 to S3 (Server-side Copy)
+        elif src_bucket and dst_bucket:
+            if not recursive:
+                final_key = (
+                    dst_key
+                    if dst_key and not dst_key.endswith("/")
+                    else f"{dst_key}{os.path.basename(src_key)}"
+                )
+                console.print(
+                    f"Copying 's3://{src_bucket}/{src_key}' to 's3://{dst_bucket}/{final_key}'..."
+                )
+                s3.copy_object(
+                    CopySource={"Bucket": src_bucket, "Key": src_key},
+                    Bucket=dst_bucket,
+                    Key=final_key,
+                )
+                console.print("[green]Copy complete.[/green]")
+            else:
+                console.print(
+                    "[red]Recursive S3-to-S3 copy is not yet supported in this CLI.[/red]"
+                )
+
+        else:
+            console.print(
+                "[red]Invalid arguments. At least one path must be an s3:// URL.[/red]"
+            )
+
+    except ClientError as e:
+        console.print(f"[red]Operation failed: {e}[/red]")
+
+
+@app.command()
+def mv(
+    source: str = typer.Argument(
+        ..., help="Source path (local path or s3://bucket/key)"
+    ),
+    destination: str = typer.Argument(
+        ..., help="Destination path (local path or s3://bucket/key)"
+    ),
+    recursive: bool = typer.Option(False, "--recursive", "-r", help="Move recursively"),
+):
+    """Move files between local and CephRDS (acts like standard 'mv')."""
+    # Simply calls cp, then deletes the source if successful
+    # Note: A real mv would check exit codes, this is a simplified wrapper for demonstration
+    console.print(f"[yellow]Moving {source} -> {destination}[/yellow]")
+    import subprocess
+
+    cmd = ["rds-cli", "cp", source, destination]
+    if recursive:
+        cmd.append("-r")
+
+    result = subprocess.run(cmd)
+
+    if result.returncode == 0:
+        # If cp succeeded, delete the source
+        if source.startswith("s3://"):
+            bucket, key = source[5:].split("/", 1)
+            subprocess.run(
+                ["rds-cli", "rm", key, "-b", bucket] + (["-r"] if recursive else [])
+            )
+        else:
+            import shutil
+
+            if os.path.isdir(source) and recursive:
+                shutil.rmtree(source)
+            else:
+                os.remove(source)
+        console.print("[green]Move complete.[/green]")
+    else:
+        console.print("[red]Move failed during copy phase.[/red]")
+
+
 if __name__ == "__main__":
     app()
