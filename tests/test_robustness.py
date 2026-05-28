@@ -103,3 +103,82 @@ def test_upload_directory_partial_failures(
     assert "Upload complete with partial failures" in result.output
     assert "1 succeeded, 1 failed" in result.output
     assert "bad.txt" in result.output
+
+
+@patch("rds_cli.client.get_s3_client")
+def test_recursive_s3_to_s3_copy(mock_get_client):
+    mock_s3 = MagicMock()
+    mock_get_client.return_value = mock_s3
+
+    mock_paginator = MagicMock()
+    mock_s3.get_paginator.return_value = mock_paginator
+    mock_paginator.paginate.return_value = [
+        {
+            "Contents": [
+                {"Key": "src/file1.txt", "Size": 10},
+                {"Key": "src/file2.txt", "Size": 20},
+            ]
+        }
+    ]
+
+    result = runner.invoke(
+        app, ["cp", "s3://src-bucket/src", "s3://dst-bucket/dst", "--recursive"]
+    )
+    assert result.exit_code == 0
+    assert "Copied src/file1.txt -> dst/file1.txt" in result.output
+    assert "Copied src/file2.txt -> dst/file2.txt" in result.output
+    assert "Copied 2 files successfully" in result.output
+
+    # Verify copy_object calls
+    assert mock_s3.copy_object.call_count == 2
+
+
+@patch("rds_cli.client.get_s3_client")
+@patch("google.cloud.storage.Client")
+def test_recursive_s3_to_gcs_copy(mock_gcs_client, mock_get_client):
+    mock_s3 = MagicMock()
+    mock_get_client.return_value = mock_s3
+
+    mock_gcs = MagicMock()
+    mock_gcs_client.return_value = mock_gcs
+
+    mock_paginator = MagicMock()
+    mock_s3.get_paginator.return_value = mock_paginator
+    mock_paginator.paginate.return_value = [
+        {
+            "Contents": [
+                {"Key": "src/file1.txt", "Size": 10},
+            ]
+        }
+    ]
+
+    result = runner.invoke(
+        app, ["cp", "s3://src-bucket/src", "gs://dst-bucket/dst", "--recursive"]
+    )
+    assert result.exit_code == 0
+    assert "Streamed src/file1.txt -> dst/file1.txt" in result.output
+    assert "Streamed 1 files successfully" in result.output
+
+
+@patch("rds_cli.client.get_s3_client")
+@patch("google.cloud.storage.Client")
+def test_recursive_gcs_to_s3_copy(mock_gcs_client, mock_get_client):
+    mock_s3 = MagicMock()
+    mock_get_client.return_value = mock_s3
+
+    mock_gcs = MagicMock()
+    mock_gcs_client.return_value = mock_gcs
+
+    mock_bucket = MagicMock()
+    mock_gcs.bucket.return_value = mock_bucket
+
+    mock_blob = MagicMock()
+    mock_blob.name = "src/file1.txt"
+    mock_bucket.list_blobs.return_value = [mock_blob]
+
+    result = runner.invoke(
+        app, ["cp", "gs://src-bucket/src", "s3://dst-bucket/dst", "--recursive"]
+    )
+    assert result.exit_code == 0
+    assert "Streamed src/file1.txt -> dst/file1.txt" in result.output
+    assert "Streamed 1 files successfully" in result.output
