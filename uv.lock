@@ -836,7 +836,7 @@ wheels = [
 
 [[package]]
 name = "rds-cli"
-version = "0.1.8"
+version = "0.1.9"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },

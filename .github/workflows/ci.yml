@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  gauntlet:
+    name: Skywalker Gauntlet Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Install Dependencies
+        run: uv sync --all-groups
+
+      - name: Run Ruff Linter
+        run: uv run ruff check .
+
+      - name: Verify Code Formatting
+        run: uv run ruff format . --check
+
+      - name: Run Static Type Check (MyPy)
+        run: uv run mypy src
+
+      - name: Run Test Suite (Pytest)
+        run: uv run pytest
