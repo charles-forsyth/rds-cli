@@ -6,6 +6,7 @@ import concurrent.futures
 from rich.console import Console
 from rich.panel import Panel
 from typing import Optional, List, Any
+from botocore.exceptions import BotoCoreError, ClientError
 from .config import CONFIG_DIR, ENV_FILE
 
 app = typer.Typer(help="CephRDS Command Line Interface")
@@ -48,7 +49,6 @@ def info(bucket: str = typer.Option(..., "--bucket", "-b", help="Bucket to check
     """Get bucket capacity and usage statistics."""
     from .client import get_s3_client
     from .utils import format_size
-    from botocore.exceptions import ClientError
 
     try:
         s3 = get_s3_client()
@@ -71,19 +71,30 @@ def info(bucket: str = typer.Option(..., "--bucket", "-b", help="Bucket to check
 
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
+    except typer.Exit:
+        raise
     except ClientError as e:
-        console.print(f"[red]Error accessing bucket: {e}[/red]")
+        console.print(f"[red]S3 API Access Error: {e}[/red]")
+    except BotoCoreError as e:
+        console.print(f"[red]Connection/Transport Error: {e}[/red]")
+    except Exception as e:
+        console.print(f"[red]An unexpected error occurred: {e}[/red]")
 
 
 @app.command()
 def ls(
     bucket: Optional[str] = typer.Option(None, "--bucket", "-b", help="Bucket to list"),
     prefix: str = typer.Option("", "--prefix", "-p", help="Filter by prefix"),
+    limit: int = typer.Option(
+        1000,
+        "--limit",
+        "-l",
+        help="Max objects to return (set -1 for unlimited to list entire bucket)",
+    ),
 ):
     """List objects in a bucket, or list all buckets if none is specified."""
     from .client import get_s3_client
     from .utils import format_size
-    from botocore.exceptions import ClientError
 
     try:
         s3 = get_s3_client()
@@ -97,27 +108,48 @@ def ls(
             return
 
         console.print(
-            f"Listing contents of: [bold cyan]{bucket}[/bold cyan] (Prefix: '{prefix}')"
+            f"Listing contents of: [bold cyan]{bucket}[/bold cyan] (Prefix: '{prefix}', Limit: {limit if limit != -1 else 'Unlimited'})"
         )
         paginator = s3.get_paginator("list_objects_v2")
         pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
 
         count = 0
         total_size = 0
+        truncated = False
+
         for page in pages:
             if "Contents" in page:
                 for obj in page["Contents"]:
+                    if limit != -1 and count >= limit:
+                        truncated = True
+                        break
                     console.print(f"\\[{format_size(obj['Size']):>10}] {obj['Key']}")
                     count += 1
                     total_size += obj["Size"]
+            if truncated:
+                break
 
-        console.print(
-            f"\nFound [bold]{count}[/bold] objects. Total size: [bold]{format_size(total_size)}[/bold]"
-        )
+        if truncated:
+            console.print(
+                f"\n[yellow]Truncated listing at limit of {limit} objects. Use '--limit -1' to list all objects.[/yellow]"
+            )
+            console.print(
+                f"Listed [bold]{count}[/bold] objects. Total size of listed: [bold]{format_size(total_size)}[/bold]"
+            )
+        else:
+            console.print(
+                f"\nFound [bold]{count}[/bold] objects. Total size: [bold]{format_size(total_size)}[/bold]"
+            )
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
+    except typer.Exit:
+        raise
     except ClientError as e:
-        console.print(f"[red]Error listing bucket: {e}[/red]")
+        console.print(f"[red]S3 API Access Error: {e}[/red]")
+    except BotoCoreError as e:
+        console.print(f"[red]Connection/Transport Error: {e}[/red]")
+    except Exception as e:
+        console.print(f"[red]An unexpected error occurred: {e}[/red]")
 
 
 @app.command()
@@ -137,7 +169,6 @@ def upload(
     """Upload a file or folder to the bucket (with optional metadata and multipart support)."""
     import boto3.s3.transfer
     from .client import get_s3_client
-    from botocore.exceptions import ClientError
 
     if not os.path.exists(local_path):
         console.print(f"[red]Error: Local path '{local_path}' does not exist.[/red]")
@@ -199,22 +230,58 @@ def upload(
             if transfer_config:
                 dir_kwargs["Config"] = transfer_config
 
-            def upload_worker(task):
-                l_file, k_key = task
-                console.print(f"  Uploading {l_file} -> {k_key}")
-                s3.upload_file(l_file, bucket, k_key, **dir_kwargs)
+            success_count = 0
+            failure_count = 0
+            failures = []
 
-            # Concurrent multi-threaded upload for high performance
+            # Concurrent multi-threaded upload for high performance & robustness
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                list(executor.map(upload_worker, upload_tasks))
+                future_to_task = {
+                    executor.submit(
+                        s3.upload_file, local_file, bucket, s3_key, **dir_kwargs
+                    ): (local_file, s3_key)
+                    for local_file, s3_key in upload_tasks
+                }
 
-            console.print(
-                f"[green]Upload complete. {len(upload_tasks)} files uploaded.[/green]"
-            )
+                for future in concurrent.futures.as_completed(future_to_task):
+                    local_file, s3_key = future_to_task[future]
+                    try:
+                        future.result()
+                        success_count += 1
+                        console.print(
+                            f"  [green]✓[/green] Uploaded {local_file} -> {s3_key}"
+                        )
+                    except Exception as exc:
+                        failure_count += 1
+                        failures.append((local_file, exc))
+                        console.print(f"  [red]✗[/red] Failed {local_file}: {exc}")
+
+            if failure_count > 0:
+                console.print(
+                    f"\n[yellow]Upload complete with partial failures: {success_count} succeeded, {failure_count} failed.[/yellow]"
+                )
+                for f_file, err in failures[:10]:
+                    console.print(f"  [red]- {f_file}: {err}[/red]")
+                if len(failures) > 10:
+                    console.print(
+                        f"  [red]... and {len(failures) - 10} more failures.[/red]"
+                    )
+                raise typer.Exit(code=1)
+            else:
+                console.print(
+                    f"\n[green]✓ Upload complete. All {success_count} files uploaded successfully![/green]"
+                )
+
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
+    except typer.Exit:
+        raise
     except ClientError as e:
-        console.print(f"[red]Upload failed: {e}[/red]")
+        console.print(f"[red]S3 API Access Error: {e}[/red]")
+    except BotoCoreError as e:
+        console.print(f"[red]Connection/Transport Error: {e}[/red]")
+    except Exception as e:
+        console.print(f"[red]An unexpected error occurred: {e}[/red]")
 
 
 @app.command()
@@ -229,7 +296,6 @@ def rm(
 ):
     """Delete a file or folder from the bucket."""
     from .client import get_s3_client
-    from botocore.exceptions import ClientError
 
     try:
         s3 = get_s3_client()
@@ -262,8 +328,14 @@ def rm(
             console.print("[green]Deletion successful.[/green]")
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
+    except typer.Exit:
+        raise
     except ClientError as e:
-        console.print(f"[red]Deletion failed: {e}[/red]")
+        console.print(f"[red]S3 API Access Error: {e}[/red]")
+    except BotoCoreError as e:
+        console.print(f"[red]Connection/Transport Error: {e}[/red]")
+    except Exception as e:
+        console.print(f"[red]An unexpected error occurred: {e}[/red]")
 
 
 @app.command()
@@ -278,7 +350,6 @@ def share(
 ):
     """Generate a temporary public URL for a file."""
     from .client import get_s3_client
-    from botocore.exceptions import ClientError
 
     try:
         s3 = get_s3_client()
@@ -291,8 +362,14 @@ def share(
         console.print(f"\n[bold green]Public URL:[/bold green]\n[cyan]{url}[/cyan]\n")
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
+    except typer.Exit:
+        raise
     except ClientError as e:
-        console.print(f"[red]Error generating URL: {e}[/red]")
+        console.print(f"[red]S3 API Access Error: {e}[/red]")
+    except BotoCoreError as e:
+        console.print(f"[red]Connection/Transport Error: {e}[/red]")
+    except Exception as e:
+        console.print(f"[red]An unexpected error occurred: {e}[/red]")
 
 
 @app.command()
@@ -305,7 +382,6 @@ def stat(
     """Show detailed info and metadata for a specific file."""
     from .client import get_s3_client
     from .utils import format_size
-    from botocore.exceptions import ClientError
 
     try:
         s3 = get_s3_client()
@@ -328,8 +404,14 @@ def stat(
 
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
+    except typer.Exit:
+        raise
     except ClientError as e:
-        console.print(f"[red]Error fetching object: {e}[/red]")
+        console.print(f"[red]S3 API Access Error: {e}[/red]")
+    except BotoCoreError as e:
+        console.print(f"[red]Connection/Transport Error: {e}[/red]")
+    except Exception as e:
+        console.print(f"[red]An unexpected error occurred: {e}[/red]")
 
 
 def _perform_cp(
@@ -341,7 +423,6 @@ def _perform_cp(
     """
     import boto3.s3.transfer
     from .client import get_s3_client
-    from botocore.exceptions import ClientError
 
     s3 = get_s3_client()
 
@@ -399,17 +480,57 @@ def _perform_cp(
                 console.print(
                     f"Uploading directory '{source}' to 's3://{dst_bucket}/{prefix}'..."
                 )
-                count = 0
+
+                upload_tasks = []
                 for root, _, files in os.walk(source):
                     for file in files:
                         local_file = os.path.join(root, file)
                         rel_path = os.path.relpath(local_file, source)
                         final_key = f"{prefix}{rel_path}".replace("\\", "/")
-                        console.print(f"  -> {final_key}")
-                        s3.upload_file(local_file, dst_bucket, final_key, **kwargs)
-                        count += 1
-                console.print(f"[green]Uploaded {count} files.[/green]")
-                return True
+                        upload_tasks.append((local_file, final_key))
+
+                success_count = 0
+                failure_count = 0
+                failures = []
+
+                # Concurrent multi-threaded upload for high performance & robustness
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    future_to_file = {
+                        executor.submit(
+                            s3.upload_file, local_file, dst_bucket, final_key, **kwargs
+                        ): (local_file, final_key)
+                        for local_file, final_key in upload_tasks
+                    }
+
+                    for future in concurrent.futures.as_completed(future_to_file):
+                        local_file, final_key = future_to_file[future]
+                        try:
+                            future.result()
+                            success_count += 1
+                            console.print(
+                                f"  [green]✓[/green] Uploaded {local_file} -> {final_key}"
+                            )
+                        except Exception as exc:
+                            failure_count += 1
+                            failures.append((local_file, exc))
+                            console.print(f"  [red]✗[/red] Failed {local_file}: {exc}")
+
+                if failure_count > 0:
+                    console.print(
+                        f"\n[yellow]Upload complete with partial failures: {success_count} succeeded, {failure_count} failed.[/yellow]"
+                    )
+                    for f_file, err in failures[:10]:
+                        console.print(f"  [red]- {f_file}: {err}[/red]")
+                    if len(failures) > 10:
+                        console.print(
+                            f"  [red]... and {len(failures) - 10} more failures.[/red]"
+                        )
+                    return False
+                else:
+                    console.print(
+                        f"[green]Uploaded {success_count} files successfully.[/green]"
+                    )
+                    return True
             else:
                 console.print(
                     "[red]Source is a directory. Use --recursive (-r) to copy.[/red]"
@@ -443,7 +564,8 @@ def _perform_cp(
                 os.makedirs(destination, exist_ok=True)
                 paginator = s3.get_paginator("list_objects_v2")
                 pages = paginator.paginate(Bucket=src_bucket, Prefix=src_key)
-                count = 0
+
+                download_tasks = []
                 for page in pages:
                     if "Contents" in page:
                         for obj in page["Contents"]:
@@ -477,13 +599,54 @@ def _perform_cp(
                                 )
                                 continue
 
-                            os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+                            download_tasks.append((obj_key, local_file_path))
 
-                            console.print(f"  <- {obj_key}")
-                            s3.download_file(src_bucket, obj_key, local_file_path)
-                            count += 1
-                console.print(f"[green]Downloaded {count} files.[/green]")
-                return True
+                success_count = 0
+                failure_count = 0
+                failures = []
+
+                # Concurrent multi-threaded download for high performance & robustness
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    future_to_file = {
+                        executor.submit(
+                            s3.download_file, src_bucket, obj_key, local_file_path
+                        ): (obj_key, local_file_path)
+                        for obj_key, local_file_path in download_tasks
+                    }
+
+                    for future in concurrent.futures.as_completed(future_to_file):
+                        obj_key, local_file_path = future_to_file[future]
+                        try:
+                            # Ensure the parent directory exists
+                            os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+                            future.result()
+                            success_count += 1
+                            console.print(
+                                f"  [green]✓[/green] Downloaded {obj_key} -> {local_file_path}"
+                            )
+                        except Exception as exc:
+                            failure_count += 1
+                            failures.append((obj_key, exc))
+                            console.print(
+                                f"  [red]✗[/red] Failed download {obj_key}: {exc}"
+                            )
+
+                if failure_count > 0:
+                    console.print(
+                        f"\n[yellow]Download complete with partial failures: {success_count} succeeded, {failure_count} failed.[/yellow]"
+                    )
+                    for f_file, err in failures[:10]:
+                        console.print(f"  [red]- {f_file}: {err}[/red]")
+                    if len(failures) > 10:
+                        console.print(
+                            f"  [red]... and {len(failures) - 10} more failures.[/red]"
+                        )
+                    return False
+                else:
+                    console.print(
+                        f"[green]Downloaded {success_count} files successfully.[/green]"
+                    )
+                    return True
 
         # Case 3: S3 to S3 (Server-side Copy)
         elif src_scheme == "s3" and dst_scheme == "s3":
@@ -593,10 +756,13 @@ def _perform_cp(
             return False
 
     except ClientError as e:
-        console.print(f"[red]Operation failed: {e}[/red]")
+        console.print(f"[red]S3 API Access Error: {e}[/red]")
+        return False
+    except BotoCoreError as e:
+        console.print(f"[red]Connection/Transport Error: {e}[/red]")
         return False
     except Exception as e:
-        console.print(f"[red]Cross-cloud operation failed: {e}[/red]")
+        console.print(f"[red]Operation failed: {e}[/red]")
         return False
 
 
@@ -661,36 +827,47 @@ def mv(
 
         src_scheme, src_bucket, src_key = parse_url(source)
 
-        if src_scheme == "s3":
-            from .client import get_s3_client
+        try:
+            if src_scheme == "s3":
+                from .client import get_s3_client
 
-            s3 = get_s3_client()
-            if recursive:
-                console.print(
-                    f"Deleting source prefix 's3://{src_bucket}/{src_key}'..."
-                )
-                paginator = s3.get_paginator("list_objects_v2")
-                pages = paginator.paginate(Bucket=src_bucket, Prefix=src_key)
-                for page in pages:
-                    if "Contents" in page:
-                        objects_to_delete = [
-                            {"Key": obj["Key"]} for obj in page["Contents"]
-                        ]
-                        # Chunk S3 deletions to 1000 object limit
-                        for i in range(0, len(objects_to_delete), 1000):
-                            chunk = objects_to_delete[i : i + 1000]
-                            s3.delete_objects(
-                                Bucket=src_bucket, Delete={"Objects": chunk}
-                            )
-            else:
-                console.print(f"Deleting source file 's3://{src_bucket}/{src_key}'...")
-                s3.delete_object(Bucket=src_bucket, Key=src_key)
-        elif src_scheme == "local":
-            if os.path.isdir(source) and recursive:
-                shutil.rmtree(source)
-            elif os.path.isfile(source):
-                os.remove(source)
-        console.print("[green]Move complete.[/green]")
+                s3 = get_s3_client()
+                if recursive:
+                    console.print(
+                        f"Deleting source prefix 's3://{src_bucket}/{src_key}'..."
+                    )
+                    paginator = s3.get_paginator("list_objects_v2")
+                    pages = paginator.paginate(Bucket=src_bucket, Prefix=src_key)
+                    for page in pages:
+                        if "Contents" in page:
+                            objects_to_delete = [
+                                {"Key": obj["Key"]} for obj in page["Contents"]
+                            ]
+                            # Chunk S3 deletions to 1000 object limit
+                            for i in range(0, len(objects_to_delete), 1000):
+                                chunk = objects_to_delete[i : i + 1000]
+                                s3.delete_objects(
+                                    Bucket=src_bucket, Delete={"Objects": chunk}
+                                )
+                else:
+                    console.print(
+                        f"Deleting source file 's3://{src_bucket}/{src_key}'..."
+                    )
+                    s3.delete_object(Bucket=src_bucket, Key=src_key)
+            elif src_scheme == "local":
+                if os.path.isdir(source) and recursive:
+                    shutil.rmtree(source)
+                elif os.path.isfile(source):
+                    os.remove(source)
+            console.print("[green]Move complete.[/green]")
+        except typer.Exit:
+            raise
+        except ClientError as e:
+            console.print(f"[red]S3 API Access Error during clean up: {e}[/red]")
+        except BotoCoreError as e:
+            console.print(f"[red]Connection/Transport Error during clean up: {e}[/red]")
+        except Exception as e:
+            console.print(f"[red]Clean up failed: {e}[/red]")
     else:
         console.print("[red]Move failed during copy phase.[/red]")
 
