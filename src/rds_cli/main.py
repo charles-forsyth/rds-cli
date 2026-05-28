@@ -1,5 +1,8 @@
 import typer
 import os
+import shutil
+import tempfile
+import concurrent.futures
 from rich.console import Console
 from rich.panel import Panel
 from typing import Optional, List, Any
@@ -21,11 +24,16 @@ S3_SECRET_KEY={secret_key}
 S3_ENDPOINT_URL={endpoint}
 """
 
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(ENV_FILE, "w") as f:
-        f.write(env_content)
-
-    ENV_FILE.chmod(0o600)
+    # Secure directory and file creation with restrictive umask
+    old_umask = os.umask(0o077)
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        # Open with O_CREAT and mode 0o600 to ensure standard file permissions
+        fd = os.open(ENV_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(env_content)
+    finally:
+        os.umask(old_umask)
 
     console.print(
         Panel(
@@ -176,24 +184,33 @@ def upload(
             console.print(
                 f"Uploading directory '{local_path}' to prefix '{bucket}/{prefix}'..."
             )
-            count = 0
+
+            upload_tasks = []
             for root, dirs, files in os.walk(local_path):
                 for file in files:
                     local_file = os.path.join(root, file)
                     rel_path = os.path.relpath(local_file, local_path)
                     s3_key = f"{prefix}{rel_path}".replace("\\", "/")
+                    upload_tasks.append((local_file, s3_key))
 
-                    console.print(f"  Uploading {local_file} -> {s3_key}")
+            dir_kwargs: dict[str, Any] = {}
+            if extra_args:
+                dir_kwargs["ExtraArgs"] = extra_args
+            if transfer_config:
+                dir_kwargs["Config"] = transfer_config
 
-                    dir_kwargs: dict[str, Any] = {}
-                    if extra_args:
-                        dir_kwargs["ExtraArgs"] = extra_args
-                    if transfer_config:
-                        dir_kwargs["Config"] = transfer_config
+            def upload_worker(task):
+                l_file, k_key = task
+                console.print(f"  Uploading {l_file} -> {k_key}")
+                s3.upload_file(l_file, bucket, k_key, **dir_kwargs)
 
-                    s3.upload_file(local_file, bucket, s3_key, **dir_kwargs)
-                    count += 1
-            console.print(f"[green]Upload complete. {count} files uploaded.[/green]")
+            # Concurrent multi-threaded upload for high performance
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                list(executor.map(upload_worker, upload_tasks))
+
+            console.print(
+                f"[green]Upload complete. {len(upload_tasks)} files uploaded.[/green]"
+            )
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
     except ClientError as e:
@@ -229,11 +246,12 @@ def rm(
                     objects_to_delete = [
                         {"Key": obj["Key"]} for obj in page["Contents"]
                     ]
-                    s3.delete_objects(
-                        Bucket=bucket, Delete={"Objects": objects_to_delete}
-                    )
-                    deleted_count += len(objects_to_delete)
-                    console.print(f"  Deleted {len(objects_to_delete)} objects...")
+                    # Chunk deletions to S3 maximum limit of 1000 objects per call
+                    for i in range(0, len(objects_to_delete), 1000):
+                        chunk = objects_to_delete[i : i + 1000]
+                        s3.delete_objects(Bucket=bucket, Delete={"Objects": chunk})
+                        deleted_count += len(chunk)
+                        console.print(f"  Deleted {len(chunk)} objects...")
 
             console.print(
                 f"[green]Deletion complete. {deleted_count} objects deleted.[/green]"
@@ -314,24 +332,16 @@ def stat(
         console.print(f"[red]Error fetching object: {e}[/red]")
 
 
-@app.command()
-def cp(
-    source: str = typer.Argument(
-        ..., help="Source path (local path, s3://bucket/key, or gs://bucket/key)"
-    ),
-    destination: str = typer.Argument(
-        ..., help="Destination path (local path, s3://bucket/key, or gs://bucket/key)"
-    ),
-    recursive: bool = typer.Option(False, "--recursive", "-r", help="Copy recursively"),
-    multipart: bool = typer.Option(
-        False, "--multipart", help="Force multipart for large files"
-    ),
-):
-    """Copy files between local, CephRDS (S3), and Google Cloud Storage (GCS)."""
+def _perform_cp(
+    source: str, destination: str, recursive: bool, multipart: bool
+) -> bool:
+    """Internal programmatic implementation of the copy logic.
+
+    Returns True on success, False on failure.
+    """
     import boto3.s3.transfer
     from .client import get_s3_client
     from botocore.exceptions import ClientError
-    import tempfile
 
     s3 = get_s3_client()
 
@@ -360,7 +370,7 @@ def cp(
                 console.print(
                     f"[red]Error: Local source '{source}' does not exist.[/red]"
                 )
-                return
+                return False
 
             kwargs: dict[str, Any] = {}
             if transfer_config:
@@ -377,6 +387,7 @@ def cp(
                 )
                 s3.upload_file(source, dst_bucket, final_key, **kwargs)
                 console.print("[green]Upload complete.[/green]")
+                return True
             elif os.path.isdir(source) and recursive:
                 prefix = (
                     dst_key
@@ -398,18 +409,25 @@ def cp(
                         s3.upload_file(local_file, dst_bucket, final_key, **kwargs)
                         count += 1
                 console.print(f"[green]Uploaded {count} files.[/green]")
+                return True
             else:
                 console.print(
                     "[red]Source is a directory. Use --recursive (-r) to copy.[/red]"
                 )
+                return False
 
         # Case 2: S3 to Local (Download)
         elif src_scheme == "s3" and dst_scheme == "local":
             if not recursive:
+                is_dir = (
+                    os.path.isdir(destination)
+                    or destination.endswith("/")
+                    or destination.endswith("\\")
+                )
                 final_dst = (
-                    destination
-                    if not os.path.isdir(destination)
-                    else os.path.join(destination, os.path.basename(src_key))
+                    os.path.join(destination, os.path.basename(src_key))
+                    if is_dir
+                    else destination
                 )
                 console.print(
                     f"Downloading 's3://{src_bucket}/{src_key}' to '{final_dst}'..."
@@ -417,6 +435,7 @@ def cp(
                 os.makedirs(os.path.dirname(os.path.abspath(final_dst)), exist_ok=True)
                 s3.download_file(src_bucket, src_key, final_dst)
                 console.print("[green]Download complete.[/green]")
+                return True
             else:
                 console.print(
                     f"Downloading recursively from 's3://{src_bucket}/{src_key}' to '{destination}'..."
@@ -432,6 +451,13 @@ def cp(
                             if obj_key.endswith("/"):
                                 continue
 
+                            # Security: Ensure we don't bleed into other directories due to partial prefix match
+                            if src_key and not src_key.endswith("/"):
+                                if obj_key != src_key and not obj_key.startswith(
+                                    src_key + "/"
+                                ):
+                                    continue
+
                             rel_path = (
                                 os.path.relpath(obj_key, src_key)
                                 if src_key
@@ -441,12 +467,23 @@ def cp(
                                 rel_path = os.path.basename(obj_key)
 
                             local_file_path = os.path.join(destination, rel_path)
+
+                            # Security check: Directory Traversal Guard
+                            abs_local_path = os.path.abspath(local_file_path)
+                            abs_destination = os.path.abspath(destination)
+                            if not abs_local_path.startswith(abs_destination):
+                                console.print(
+                                    f"[red]Security Alert: Traversal pattern skipped: {obj_key} -> {local_file_path}[/red]"
+                                )
+                                continue
+
                             os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
 
                             console.print(f"  <- {obj_key}")
                             s3.download_file(src_bucket, obj_key, local_file_path)
                             count += 1
                 console.print(f"[green]Downloaded {count} files.[/green]")
+                return True
 
         # Case 3: S3 to S3 (Server-side Copy)
         elif src_scheme == "s3" and dst_scheme == "s3":
@@ -465,10 +502,12 @@ def cp(
                     Key=final_key,
                 )
                 console.print("[green]Copy complete.[/green]")
+                return True
             else:
                 console.print(
                     "[red]Recursive S3-to-S3 copy is not yet supported in this CLI.[/red]"
                 )
+                return False
 
         # Case 4: S3 to GCS (Cross-Cloud)
         elif src_scheme == "s3" and dst_scheme == "gs":
@@ -479,7 +518,7 @@ def cp(
                 console.print(
                     "[red]Recursive cross-cloud copy is not supported yet.[/red]"
                 )
-                return
+                return False
 
             final_key = (
                 dst_key
@@ -492,6 +531,7 @@ def cp(
 
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp_name = tmp.name
+                tmp.close()  # Close descriptor immediately
 
             try:
                 dl_kwargs_s3: dict[str, Any] = {}
@@ -503,6 +543,7 @@ def cp(
                 blob = gcs_bucket.blob(final_key)
                 blob.upload_from_filename(tmp_name)
                 console.print("[green]Cross-cloud copy complete.[/green]")
+                return True
             finally:
                 if os.path.exists(tmp_name):
                     os.remove(tmp_name)
@@ -516,7 +557,7 @@ def cp(
                 console.print(
                     "[red]Recursive cross-cloud copy is not supported yet.[/red]"
                 )
-                return
+                return False
 
             final_key = (
                 dst_key
@@ -529,6 +570,7 @@ def cp(
 
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp_name = tmp.name
+                tmp.close()  # Close descriptor immediately
 
             try:
                 gcs_bucket = gcs.bucket(src_bucket)
@@ -541,17 +583,56 @@ def cp(
 
                 s3.upload_file(tmp_name, dst_bucket, final_key, **kwargs_s3)
                 console.print("[green]Cross-cloud copy complete.[/green]")
+                return True
             finally:
                 if os.path.exists(tmp_name):
                     os.remove(tmp_name)
 
         else:
             console.print("[red]Invalid arguments or unsupported copy operation.[/red]")
+            return False
 
     except ClientError as e:
         console.print(f"[red]Operation failed: {e}[/red]")
+        return False
     except Exception as e:
         console.print(f"[red]Cross-cloud operation failed: {e}[/red]")
+        return False
+
+
+@app.command()
+def cp(
+    source: str = typer.Argument(
+        ..., help="Source path (local path, s3://bucket/key, or gs://bucket/key)"
+    ),
+    destination: str = typer.Argument(
+        ..., help="Destination path (local path, s3://bucket/key, or gs://bucket/key)"
+    ),
+    recursive: bool = typer.Option(False, "--recursive", "-r", help="Copy recursively"),
+    multipart: bool = typer.Option(
+        False, "--multipart", help="Force multipart for large files"
+    ),
+):
+    """Copy files between local, CephRDS (S3), and Google Cloud Storage (GCS)."""
+    _perform_cp(source, destination, recursive, multipart)
+
+
+@app.command()
+def download(
+    key: str = typer.Argument(
+        ..., help="S3 object key (or prefix if --recursive) to download"
+    ),
+    bucket: str = typer.Option(..., "--bucket", "-b", help="Source bucket"),
+    destination: str = typer.Option(
+        ".", "--destination", "-d", help="Local destination path"
+    ),
+    recursive: bool = typer.Option(
+        False, "--recursive", "-r", help="Download all files under a prefix"
+    ),
+):
+    """Download a file or folder from the bucket."""
+    source_url = f"s3://{bucket}/{key}"
+    _perform_cp(source_url, destination, recursive=recursive, multipart=False)
 
 
 @app.command()
@@ -565,30 +646,49 @@ def mv(
     recursive: bool = typer.Option(False, "--recursive", "-r", help="Move recursively"),
 ):
     """Move files between local and CephRDS (acts like standard 'mv')."""
-    # Simply calls cp, then deletes the source if successful
-    # Note: A real mv would check exit codes, this is a simplified wrapper for demonstration
     console.print(f"[yellow]Moving {source} -> {destination}[/yellow]")
-    import subprocess
 
-    cmd = ["rds-cli", "cp", source, destination]
-    if recursive:
-        cmd.append("-r")
+    # Run copy programmatically without any subprocesses!
+    success = _perform_cp(source, destination, recursive, multipart=False)
 
-    result = subprocess.run(cmd)
+    if success:
 
-    if result.returncode == 0:
-        # If cp succeeded, delete the source
-        if source.startswith("s3://"):
-            bucket, key = source[5:].split("/", 1)
-            subprocess.run(
-                ["rds-cli", "rm", key, "-b", bucket] + (["-r"] if recursive else [])
-            )
-        else:
-            import shutil
+        def parse_url(url: str):
+            if url.startswith("s3://"):
+                parts = url[5:].split("/", 1)
+                return "s3", parts[0], parts[1] if len(parts) > 1 else ""
+            return "local", None, url
 
+        src_scheme, src_bucket, src_key = parse_url(source)
+
+        if src_scheme == "s3":
+            from .client import get_s3_client
+
+            s3 = get_s3_client()
+            if recursive:
+                console.print(
+                    f"Deleting source prefix 's3://{src_bucket}/{src_key}'..."
+                )
+                paginator = s3.get_paginator("list_objects_v2")
+                pages = paginator.paginate(Bucket=src_bucket, Prefix=src_key)
+                for page in pages:
+                    if "Contents" in page:
+                        objects_to_delete = [
+                            {"Key": obj["Key"]} for obj in page["Contents"]
+                        ]
+                        # Chunk S3 deletions to 1000 object limit
+                        for i in range(0, len(objects_to_delete), 1000):
+                            chunk = objects_to_delete[i : i + 1000]
+                            s3.delete_objects(
+                                Bucket=src_bucket, Delete={"Objects": chunk}
+                            )
+            else:
+                console.print(f"Deleting source file 's3://{src_bucket}/{src_key}'...")
+                s3.delete_object(Bucket=src_bucket, Key=src_key)
+        elif src_scheme == "local":
             if os.path.isdir(source) and recursive:
                 shutil.rmtree(source)
-            else:
+            elif os.path.isfile(source):
                 os.remove(source)
         console.print("[green]Move complete.[/green]")
     else:
