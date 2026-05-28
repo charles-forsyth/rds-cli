@@ -692,9 +692,9 @@ def _perform_cp(
                 f"Streaming 's3://{src_bucket}/{src_key}' -> 'gs://{dst_bucket}/{final_key}'..."
             )
 
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp_name = tmp.name
-                tmp.close()  # Close descriptor immediately
+            tmp = tempfile.NamedTemporaryFile(delete=False)
+            tmp_name = tmp.name
+            tmp.close()
 
             try:
                 dl_kwargs_s3: dict[str, Any] = {}
@@ -731,9 +731,9 @@ def _perform_cp(
                 f"Streaming 'gs://{src_bucket}/{src_key}' -> 's3://{dst_bucket}/{final_key}'..."
             )
 
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp_name = tmp.name
-                tmp.close()  # Close descriptor immediately
+            tmp = tempfile.NamedTemporaryFile(delete=False)
+            tmp_name = tmp.name
+            tmp.close()
 
             try:
                 gcs_bucket = gcs.bucket(src_bucket)
