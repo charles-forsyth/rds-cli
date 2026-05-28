@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.13] - 2026-05-28
+
+### Added
+- **Subcommand Aliases:** Support for commands: `list` &rarr; `ls`, `copy` &rarr; `cp`, `move` &rarr; `mv`, and `delete`/`remove` &rarr; `rm`.
+- **Semantic Clarity Renaming:** Renamed `info` &rarr; `bucket-info` and `stat` &rarr; `file-info`, keeping original names as deprecated aliases with warnings.
+- **Improved Test Coverage:** Comprehensive unit tests covering deprecated subcommands, aliases, and warning output.
+
+### Changed
+- **Refactored DRY Upload:** Upload subcommand now delegates cleanly directly to `_perform_cp` using metadata-dict parsing.
+
+---
+
+## [0.1.12] - 2026-05-28
+
+### Added
+- **Recursive Copies:** Programmatic support for recursive copies across local paths, CephRDS S3, and Google Cloud Storage (GCS).
+
+---
+
+## [0.1.11] - 2026-05-28
+
+### Fixed
+- **Cross-Platform Descriptor Safety:** Prevented potential file sharing violations by closing temporary file descriptor outside context managers.
+
+---
+
 ## [0.1.10] - 2026-05-28
 
 ### Added
