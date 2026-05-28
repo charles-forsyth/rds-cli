@@ -44,8 +44,10 @@ S3_ENDPOINT_URL={endpoint}
     )
 
 
-@app.command()
-def info(bucket: str = typer.Option(..., "--bucket", "-b", help="Bucket to check")):
+@app.command(name="bucket-info")
+def bucket_info(
+    bucket: str = typer.Option(..., "--bucket", "-b", help="Bucket to check"),
+):
     """Get bucket capacity and usage statistics."""
     from .client import get_s3_client
     from .utils import format_size
@@ -79,6 +81,15 @@ def info(bucket: str = typer.Option(..., "--bucket", "-b", help="Bucket to check
         console.print(f"[red]Connection/Transport Error: {e}[/red]")
     except Exception as e:
         console.print(f"[red]An unexpected error occurred: {e}[/red]")
+
+
+@app.command(name="info")
+def info(bucket: str = typer.Option(..., "--bucket", "-b", help="Bucket to check")):
+    """Get bucket capacity and usage statistics. (Deprecated: use 'bucket-info' instead)"""
+    console.print(
+        "[yellow]Warning: 'info' is deprecated. Please use 'bucket-info' instead.[/yellow]"
+    )
+    bucket_info(bucket=bucket)
 
 
 @app.command()
@@ -167,121 +178,38 @@ def upload(
     ),
 ):
     """Upload a file or folder to the bucket (with optional metadata and multipart support)."""
-    import boto3.s3.transfer
-    from .client import get_s3_client
+    import os
 
     if not os.path.exists(local_path):
         console.print(f"[red]Error: Local path '{local_path}' does not exist.[/red]")
-        return
+        raise typer.Exit(code=1)
 
-    extra_args = {}
+    meta_dict = {}
     if meta:
-        meta_dict = {}
         for m in meta:
             if "=" in m:
                 k, v = m.split("=", 1)
                 meta_dict[k] = v
         if meta_dict:
-            extra_args["Metadata"] = meta_dict
             console.print(f"[dim]Applying metadata: {meta_dict}[/dim]")
 
-    transfer_config = None
-    if multipart:
-        console.print("[dim]Forcing multipart upload (5MB chunks).[/dim]")
-        transfer_config = boto3.s3.transfer.TransferConfig(
-            multipart_threshold=5 * 1024 * 1024, multipart_chunksize=5 * 1024 * 1024
-        )
+    if os.path.isdir(local_path):
+        prefix = key or os.path.basename(os.path.abspath(local_path))
+        dst_url = f"s3://{bucket}/{prefix}"
+        recursive = True
+    else:
+        dst_url = f"s3://{bucket}/{key or ''}"
+        recursive = False
 
-    try:
-        s3 = get_s3_client()
-        if os.path.isfile(local_path):
-            s3_key = key or os.path.basename(local_path)
-            console.print(f"Uploading file '{local_path}' to '{bucket}/{s3_key}'...")
-
-            file_kwargs: dict[str, Any] = {}
-            if extra_args:
-                file_kwargs["ExtraArgs"] = extra_args
-            if transfer_config:
-                file_kwargs["Config"] = transfer_config
-
-            s3.upload_file(local_path, bucket, s3_key, **file_kwargs)
-            console.print("[green]Upload successful.[/green]")
-
-        elif os.path.isdir(local_path):
-            prefix = key or os.path.basename(os.path.abspath(local_path))
-            if prefix and not prefix.endswith("/"):
-                prefix += "/"
-
-            console.print(
-                f"Uploading directory '{local_path}' to prefix '{bucket}/{prefix}'..."
-            )
-
-            upload_tasks = []
-            for root, dirs, files in os.walk(local_path):
-                for file in files:
-                    local_file = os.path.join(root, file)
-                    rel_path = os.path.relpath(local_file, local_path)
-                    s3_key = f"{prefix}{rel_path}".replace("\\", "/")
-                    upload_tasks.append((local_file, s3_key))
-
-            dir_kwargs: dict[str, Any] = {}
-            if extra_args:
-                dir_kwargs["ExtraArgs"] = extra_args
-            if transfer_config:
-                dir_kwargs["Config"] = transfer_config
-
-            success_count = 0
-            failure_count = 0
-            failures = []
-
-            # Concurrent multi-threaded upload for high performance & robustness
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                future_to_task = {
-                    executor.submit(
-                        s3.upload_file, local_file, bucket, s3_key, **dir_kwargs
-                    ): (local_file, s3_key)
-                    for local_file, s3_key in upload_tasks
-                }
-
-                for future in concurrent.futures.as_completed(future_to_task):
-                    local_file, s3_key = future_to_task[future]
-                    try:
-                        future.result()
-                        success_count += 1
-                        console.print(
-                            f"  [green]✓[/green] Uploaded {local_file} -> {s3_key}"
-                        )
-                    except Exception as exc:
-                        failure_count += 1
-                        failures.append((local_file, exc))
-                        console.print(f"  [red]✗[/red] Failed {local_file}: {exc}")
-
-            if failure_count > 0:
-                console.print(
-                    f"\n[yellow]Upload complete with partial failures: {success_count} succeeded, {failure_count} failed.[/yellow]"
-                )
-                for f_file, err in failures[:10]:
-                    console.print(f"  [red]- {f_file}: {err}[/red]")
-                if len(failures) > 10:
-                    console.print(
-                        f"  [red]... and {len(failures) - 10} more failures.[/red]"
-                    )
-                raise typer.Exit(code=1)
-            else:
-                console.print(
-                    f"\n[green]✓ Upload complete. All {success_count} files uploaded successfully![/green]"
-                )
-
-    except ValueError as e:
-        console.print(f"[red]{e}[/red]")
-    except typer.Exit:
-        raise
-    except ClientError as e:
-        console.print(f"[red]S3 API Access Error: {e}[/red]")
-    except BotoCoreError as e:
-        console.print(f"[red]Connection/Transport Error: {e}[/red]")
-    except Exception as e:
-        console.print(f"[red]An unexpected error occurred: {e}[/red]")
+    success = _perform_cp(
+        source=local_path,
+        destination=dst_url,
+        recursive=recursive,
+        multipart=multipart,
+        metadata=meta_dict if meta_dict else None,
+    )
+    if not success:
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -372,8 +300,8 @@ def share(
         console.print(f"[red]An unexpected error occurred: {e}[/red]")
 
 
-@app.command()
-def stat(
+@app.command(name="file-info")
+def file_info(
     key: str = typer.Argument(..., help="S3 object key to inspect"),
     bucket: str = typer.Option(
         ..., "--bucket", "-b", help="Bucket containing the object"
@@ -414,8 +342,26 @@ def stat(
         console.print(f"[red]An unexpected error occurred: {e}[/red]")
 
 
+@app.command(name="stat")
+def stat(
+    key: str = typer.Argument(..., help="S3 object key to inspect"),
+    bucket: str = typer.Option(
+        ..., "--bucket", "-b", help="Bucket containing the object"
+    ),
+):
+    """Show detailed info and metadata for a specific file. (Deprecated: use 'file-info' instead)"""
+    console.print(
+        "[yellow]Warning: 'stat' is deprecated. Please use 'file-info' instead.[/yellow]"
+    )
+    file_info(key=key, bucket=bucket)
+
+
 def _perform_cp(
-    source: str, destination: str, recursive: bool, multipart: bool
+    source: str,
+    destination: str,
+    recursive: bool,
+    multipart: bool,
+    metadata: Optional[dict[str, str]] = None,
 ) -> bool:
     """Internal programmatic implementation of the copy logic.
 
@@ -456,6 +402,8 @@ def _perform_cp(
             kwargs: dict[str, Any] = {}
             if transfer_config:
                 kwargs["Config"] = transfer_config
+            if metadata:
+                kwargs["ExtraArgs"] = {"Metadata": metadata}
 
             if os.path.isfile(source):
                 final_key = (
@@ -1157,6 +1105,80 @@ def mv(
             console.print(f"[red]Clean up failed: {e}[/red]")
     else:
         console.print("[red]Move failed during copy phase.[/red]")
+
+
+@app.command(name="list")
+def list_objects(
+    bucket: Optional[str] = typer.Option(None, "--bucket", "-b", help="Bucket to list"),
+    prefix: str = typer.Option("", "--prefix", "-p", help="Filter by prefix"),
+    limit: int = typer.Option(
+        1000,
+        "--limit",
+        "-l",
+        help="Max objects to return (set -1 for unlimited to list entire bucket)",
+    ),
+):
+    """List objects in a bucket, or list all buckets if none is specified. (Alias for 'ls')"""
+    ls(bucket=bucket, prefix=prefix, limit=limit)
+
+
+@app.command(name="copy")
+def copy_objects(
+    source: str = typer.Argument(
+        ..., help="Source path (local path, s3://bucket/key, or gs://bucket/key)"
+    ),
+    destination: str = typer.Argument(
+        ..., help="Destination path (local path, s3://bucket/key, or gs://bucket/key)"
+    ),
+    recursive: bool = typer.Option(False, "--recursive", "-r", help="Copy recursively"),
+    multipart: bool = typer.Option(
+        False, "--multipart", help="Force multipart for large files"
+    ),
+):
+    """Copy files between local, CephRDS (S3), and Google Cloud Storage (GCS). (Alias for 'cp')"""
+    cp(source=source, destination=destination, recursive=recursive, multipart=multipart)
+
+
+@app.command(name="move")
+def move_objects(
+    source: str = typer.Argument(
+        ..., help="Source path (local path or s3://bucket/key)"
+    ),
+    destination: str = typer.Argument(
+        ..., help="Destination path (local path or s3://bucket/key)"
+    ),
+    recursive: bool = typer.Option(False, "--recursive", "-r", help="Move recursively"),
+):
+    """Move files between local and CephRDS. (Alias for 'mv')"""
+    mv(source=source, destination=destination, recursive=recursive)
+
+
+@app.command(name="delete")
+def delete_objects(
+    key: str = typer.Argument(
+        ..., help="S3 object key (or prefix if --recursive) to delete"
+    ),
+    bucket: str = typer.Option(..., "--bucket", "-b", help="Destination bucket"),
+    recursive: bool = typer.Option(
+        False, "--recursive", "-r", help="Delete all files under a prefix"
+    ),
+):
+    """Delete a file or folder from the bucket. (Alias for 'rm')"""
+    rm(key=key, bucket=bucket, recursive=recursive)
+
+
+@app.command(name="remove")
+def remove_objects(
+    key: str = typer.Argument(
+        ..., help="S3 object key (or prefix if --recursive) to delete"
+    ),
+    bucket: str = typer.Option(..., "--bucket", "-b", help="Destination bucket"),
+    recursive: bool = typer.Option(
+        False, "--recursive", "-r", help="Delete all files under a prefix"
+    ),
+):
+    """Delete a file or folder from the bucket. (Alias for 'rm')"""
+    rm(key=key, bucket=bucket, recursive=recursive)
 
 
 if __name__ == "__main__":
