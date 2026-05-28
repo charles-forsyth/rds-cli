@@ -87,15 +87,15 @@ export AWS_S3_ENDPOINT_URL="https://rds.ucr.edu"
 | Command | Usage | Description |
 | :--- | :--- | :--- |
 | **`auth`** | `rds-cli auth` | Interactively configure S3 Access Key, Secret Key, and Endpoint. |
-| **`info`** | `rds-cli info -b <bucket>` | Retrieve total object count, bucket size, quota, and percentage usage. |
-| **`ls`** | `rds-cli ls [-b <bucket>] [-p <prefix>] [-l <limit>]` | List available buckets, prefix objects, or paths with safety limits. |
+| **`bucket-info`** | `rds-cli bucket-info -b <bucket>` | Retrieve total object count, bucket size, quota, and percentage usage. (Deprecated alias: `info`). |
+| **`file-info`** | `rds-cli file-info <key> -b <bucket>` | Fetch file sizes, creation timestamps, and custom metadata. (Deprecated alias: `stat`). |
+| **`ls`** | `rds-cli ls [-b <bucket>] [-p <prefix>] [-l <limit>]` | List available buckets, prefix objects, or paths with safety limits. (Alias: `list`). |
 | **`upload`** | `rds-cli upload <path> -b <bucket> [-k <key>] [-m k=v] [--multipart]` | Upload local files or folders recursively with concurrent task queues. |
 | **`download`**| `rds-cli download <key> -b <bucket> [-d <dest>] [-r]` | Download single objects or entire S3 prefix structures concurrently. |
-| **`cp`** | `rds-cli cp <src> <dest> [-r] [--multipart]` | Copy files between Local, CephRDS (`s3://`), and GCS (`gs://`). |
-| **`mv`** | `rds-cli mv <src> <dest> [-r]` | Move files programmatically, automatically cleaning up source on success. |
-| **`rm`** | `rds-cli rm <key> -b <bucket> [-r]` | Delete individual files or chunked prefixes (handles up to 1000 keys per call). |
+| **`cp`** | `rds-cli cp <src> <dest> [-r] [--multipart]` | Copy files between Local, CephRDS (`s3://`), and GCS (`gs://`). (Alias: `copy`). |
+| **`mv`** | `rds-cli mv <src> <dest> [-r]` | Move files programmatically, automatically cleaning up source on success. (Alias: `move`). |
+| **`rm`** | `rds-cli rm <key> -b <bucket> [-r]` | Delete individual files or chunked prefixes (handles up to 1000 keys per call). (Aliases: `delete`, `remove`). |
 | **`share`** | `rds-cli share <key> -b <bucket> [-e <secs>]` | Generate cryptographically signed, expiring public links. |
-| **`stat`** | `rds-cli stat <key> -b <bucket>` | Fetch file sizes, creation timestamps, and custom metadata. |
 
 ---
 
@@ -104,7 +104,7 @@ export AWS_S3_ENDPOINT_URL="https://rds.ucr.edu"
 ### 📊 Storage Auditing & Monitoring
 Retrieve bucket statistics and usage quota:
 ```bash
-rds-cli info -b neuroscience-imaging
+rds-cli bucket-info -b neuroscience-imaging
 ```
 
 List up to 500 files inside a specific directory:
@@ -120,7 +120,7 @@ rds-cli ls -b neuroscience-imaging -l -1
 ### 📤 Concurrent Uploads with Custom Metadata
 Recursively upload raw dataset directories and tag them with project details:
 ```bash
-rds-cli upload ./raw_images/ -b neuroscience-imaging -k projects/raw_study/ -m owner=cforsyth -m type=experimental
+rds-cli upload ./raw_images/ -b neuroscience-imaging -k projects/raw_study/ -m owner=forsythc -m type=experimental
 ```
 
 Force multipart uploads for huge dataset tarballs (>1GB) to bypass satellite jitter:
