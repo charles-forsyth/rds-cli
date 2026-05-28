@@ -668,9 +668,92 @@ def _perform_cp(
                 return True
             else:
                 console.print(
-                    "[red]Recursive S3-to-S3 copy is not yet supported in this CLI.[/red]"
+                    f"Copying recursively from 's3://{src_bucket}/{src_key}' to 's3://{dst_bucket}/{dst_key or ''}'..."
                 )
-                return False
+                paginator = s3.get_paginator("list_objects_v2")
+                pages = paginator.paginate(Bucket=src_bucket, Prefix=src_key)
+
+                prefix = (
+                    dst_key
+                    if dst_key and dst_key.endswith("/")
+                    else f"{dst_key}/"
+                    if dst_key
+                    else ""
+                )
+
+                copy_tasks = []
+                for page in pages:
+                    if "Contents" in page:
+                        for obj in page["Contents"]:
+                            obj_key = obj["Key"]
+                            if obj_key.endswith("/"):
+                                continue
+
+                            # Security: Ensure we don't bleed into other directories due to partial prefix match
+                            if src_key and not src_key.endswith("/"):
+                                if obj_key != src_key and not obj_key.startswith(
+                                    src_key + "/"
+                                ):
+                                    continue
+
+                            rel_path = (
+                                os.path.relpath(obj_key, src_key)
+                                if src_key
+                                else obj_key
+                            )
+                            if rel_path == ".":
+                                rel_path = os.path.basename(obj_key)
+
+                            final_key = f"{prefix}{rel_path}".replace("\\", "/")
+                            copy_tasks.append((obj_key, final_key))
+
+                success_count = 0
+                failure_count = 0
+                failures = []
+
+                # Concurrent multi-threaded server-side copy for high performance & robustness
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    future_to_copy = {
+                        executor.submit(
+                            s3.copy_object,
+                            CopySource={"Bucket": src_bucket, "Key": obj_key},
+                            Bucket=dst_bucket,
+                            Key=final_key,
+                        ): (obj_key, final_key)
+                        for obj_key, final_key in copy_tasks
+                    }
+
+                    for future in concurrent.futures.as_completed(future_to_copy):
+                        obj_key, final_key = future_to_copy[future]
+                        try:
+                            future.result()
+                            success_count += 1
+                            console.print(
+                                f"  [green]✓[/green] Copied {obj_key} -> {final_key}"
+                            )
+                        except Exception as exc:
+                            failure_count += 1
+                            failures.append((obj_key, exc))
+                            console.print(
+                                f"  [red]✗[/red] Failed copy {obj_key}: {exc}"
+                            )
+
+                if failure_count > 0:
+                    console.print(
+                        f"\n[yellow]Copy complete with partial failures: {success_count} succeeded, {failure_count} failed.[/yellow]"
+                    )
+                    for f_file, err in failures[:10]:
+                        console.print(f"  [red]- {f_file}: {err}[/red]")
+                    if len(failures) > 10:
+                        console.print(
+                            f"  [red]... and {len(failures) - 10} more failures.[/red]"
+                        )
+                    return False
+                else:
+                    console.print(
+                        f"[green]Copied {success_count} files successfully.[/green]"
+                    )
+                    return True
 
         # Case 4: S3 to GCS (Cross-Cloud)
         elif src_scheme == "s3" and dst_scheme == "gs":
@@ -679,37 +762,143 @@ def _perform_cp(
             gcs = storage.Client()
             if recursive:
                 console.print(
-                    "[red]Recursive cross-cloud copy is not supported yet.[/red]"
+                    f"Streaming recursively from 's3://{src_bucket}/{src_key}' to 'gs://{dst_bucket}/{dst_key or ''}'..."
                 )
-                return False
+                paginator = s3.get_paginator("list_objects_v2")
+                pages = paginator.paginate(Bucket=src_bucket, Prefix=src_key)
 
-            final_key = (
-                dst_key
-                if dst_key and not dst_key.endswith("/")
-                else f"{dst_key}{os.path.basename(src_key)}"
-            )
-            console.print(
-                f"Streaming 's3://{src_bucket}/{src_key}' -> 'gs://{dst_bucket}/{final_key}'..."
-            )
+                prefix = (
+                    dst_key
+                    if dst_key and dst_key.endswith("/")
+                    else f"{dst_key}/"
+                    if dst_key
+                    else ""
+                )
 
-            tmp = tempfile.NamedTemporaryFile(delete=False)
-            tmp_name = tmp.name
-            tmp.close()
+                transfer_tasks = []
+                for page in pages:
+                    if "Contents" in page:
+                        for obj in page["Contents"]:
+                            obj_key = obj["Key"]
+                            if obj_key.endswith("/"):
+                                continue
 
-            try:
-                dl_kwargs_s3: dict[str, Any] = {}
-                if transfer_config:
-                    dl_kwargs_s3["Config"] = transfer_config
+                            # Security: Ensure we don't bleed into other directories due to partial prefix match
+                            if src_key and not src_key.endswith("/"):
+                                if obj_key != src_key and not obj_key.startswith(
+                                    src_key + "/"
+                                ):
+                                    continue
 
-                s3.download_file(src_bucket, src_key, tmp_name, **dl_kwargs_s3)
-                gcs_bucket = gcs.bucket(dst_bucket)
-                blob = gcs_bucket.blob(final_key)
-                blob.upload_from_filename(tmp_name)
-                console.print("[green]Cross-cloud copy complete.[/green]")
-                return True
-            finally:
-                if os.path.exists(tmp_name):
-                    os.remove(tmp_name)
+                            rel_path = (
+                                os.path.relpath(obj_key, src_key)
+                                if src_key
+                                else obj_key
+                            )
+                            if rel_path == ".":
+                                rel_path = os.path.basename(obj_key)
+
+                            final_key = f"{prefix}{rel_path}".replace("\\", "/")
+                            transfer_tasks.append((obj_key, final_key))
+
+                def transfer_s3_to_gcs_file(
+                    s3_client, src_b, src_k, gcs_client, dst_b, dst_k, config
+                ):
+                    tmp = tempfile.NamedTemporaryFile(delete=False)
+                    tmp_name = tmp.name
+                    tmp.close()
+                    try:
+                        dl_kwargs: dict[str, Any] = {}
+                        if config:
+                            dl_kwargs["Config"] = config
+                        s3_client.download_file(src_b, src_k, tmp_name, **dl_kwargs)
+
+                        gcs_bucket = gcs_client.bucket(dst_b)
+                        blob = gcs_bucket.blob(dst_k)
+                        blob.upload_from_filename(tmp_name)
+                    finally:
+                        if os.path.exists(tmp_name):
+                            os.remove(tmp_name)
+
+                success_count = 0
+                failure_count = 0
+                failures = []
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    future_to_transfer = {
+                        executor.submit(
+                            transfer_s3_to_gcs_file,
+                            s3,
+                            src_bucket,
+                            obj_key,
+                            gcs,
+                            dst_bucket,
+                            final_key,
+                            transfer_config,
+                        ): (obj_key, final_key)
+                        for obj_key, final_key in transfer_tasks
+                    }
+
+                    for future in concurrent.futures.as_completed(future_to_transfer):
+                        obj_key, final_key = future_to_transfer[future]
+                        try:
+                            future.result()
+                            success_count += 1
+                            console.print(
+                                f"  [green]✓[/green] Streamed {obj_key} -> {final_key}"
+                            )
+                        except Exception as exc:
+                            failure_count += 1
+                            failures.append((obj_key, exc))
+                            console.print(
+                                f"  [red]✗[/red] Failed stream {obj_key}: {exc}"
+                            )
+
+                if failure_count > 0:
+                    console.print(
+                        f"\n[yellow]Cross-cloud copy complete with partial failures: {success_count} succeeded, {failure_count} failed.[/yellow]"
+                    )
+                    for f_file, err in failures[:10]:
+                        console.print(f"  [red]- {f_file}: {err}[/red]")
+                    if len(failures) > 10:
+                        console.print(
+                            f"  [red]... and {len(failures) - 10} more failures.[/red]"
+                        )
+                    return False
+                else:
+                    console.print(
+                        f"[green]Streamed {success_count} files successfully.[/green]"
+                    )
+                    return True
+
+            else:
+                final_key = (
+                    dst_key
+                    if dst_key and not dst_key.endswith("/")
+                    else f"{dst_key}{os.path.basename(src_key)}"
+                )
+                console.print(
+                    f"Streaming 's3://{src_bucket}/{src_key}' -> 'gs://{dst_bucket}/{final_key}'..."
+                )
+
+                tmp = tempfile.NamedTemporaryFile(delete=False)
+                tmp_name = tmp.name
+                tmp.close()
+
+                try:
+                    dl_kwargs_s3: dict[str, Any] = {}
+                    if transfer_config:
+                        dl_kwargs_s3["Config"] = transfer_config
+
+                    s3.download_file(src_bucket, src_key, tmp_name, **dl_kwargs_s3)
+                    gcs_bucket = gcs.bucket(dst_bucket)
+                    blob = gcs_bucket.blob(final_key)
+                    blob.upload_from_filename(tmp_name)
+                    console.print("[green]Cross-cloud copy complete.[/green]")
+                    return True
+                finally:
+                    if os.path.exists(tmp_name):
+                        os.remove(tmp_name)
 
         # Case 5: GCS to S3 (Cross-Cloud)
         elif src_scheme == "gs" and dst_scheme == "s3":
@@ -718,38 +907,136 @@ def _perform_cp(
             gcs = storage.Client()
             if recursive:
                 console.print(
-                    "[red]Recursive cross-cloud copy is not supported yet.[/red]"
+                    f"Streaming recursively from 'gs://{src_bucket}/{src_key}' to 's3://{dst_bucket}/{dst_key or ''}'..."
                 )
-                return False
-
-            final_key = (
-                dst_key
-                if dst_key and not dst_key.endswith("/")
-                else f"{dst_key}{os.path.basename(src_key)}"
-            )
-            console.print(
-                f"Streaming 'gs://{src_bucket}/{src_key}' -> 's3://{dst_bucket}/{final_key}'..."
-            )
-
-            tmp = tempfile.NamedTemporaryFile(delete=False)
-            tmp_name = tmp.name
-            tmp.close()
-
-            try:
                 gcs_bucket = gcs.bucket(src_bucket)
-                blob = gcs_bucket.blob(src_key)
-                blob.download_to_filename(tmp_name)
+                blobs = gcs_bucket.list_blobs(prefix=src_key)
 
-                kwargs_s3: dict[str, Any] = {}
-                if transfer_config:
-                    kwargs_s3["Config"] = transfer_config
+                prefix = (
+                    dst_key
+                    if dst_key and dst_key.endswith("/")
+                    else f"{dst_key}/"
+                    if dst_key
+                    else ""
+                )
 
-                s3.upload_file(tmp_name, dst_bucket, final_key, **kwargs_s3)
-                console.print("[green]Cross-cloud copy complete.[/green]")
-                return True
-            finally:
-                if os.path.exists(tmp_name):
-                    os.remove(tmp_name)
+                transfer_tasks = []
+                for blob in blobs:
+                    obj_key = blob.name
+                    if obj_key.endswith("/"):
+                        continue
+
+                    # Security: Ensure we don't bleed into other directories due to partial prefix match
+                    if src_key and not src_key.endswith("/"):
+                        if obj_key != src_key and not obj_key.startswith(src_key + "/"):
+                            continue
+
+                    rel_path = os.path.relpath(obj_key, src_key) if src_key else obj_key
+                    if rel_path == ".":
+                        rel_path = os.path.basename(obj_key)
+
+                    final_key = f"{prefix}{rel_path}".replace("\\", "/")
+                    transfer_tasks.append((obj_key, final_key))
+
+                def transfer_gcs_to_s3_file(
+                    gcs_client, src_b, src_k, s3_client, dst_b, dst_k, config
+                ):
+                    tmp = tempfile.NamedTemporaryFile(delete=False)
+                    tmp_name = tmp.name
+                    tmp.close()
+                    try:
+                        gcs_bucket = gcs_client.bucket(src_b)
+                        blob = gcs_bucket.blob(src_k)
+                        blob.download_to_filename(tmp_name)
+
+                        kwargs_s3: dict[str, Any] = {}
+                        if config:
+                            kwargs_s3["Config"] = config
+                        s3_client.upload_file(tmp_name, dst_b, dst_k, **kwargs_s3)
+                    finally:
+                        if os.path.exists(tmp_name):
+                            os.remove(tmp_name)
+
+                success_count = 0
+                failure_count = 0
+                failures = []
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    future_to_transfer = {
+                        executor.submit(
+                            transfer_gcs_to_s3_file,
+                            gcs,
+                            src_bucket,
+                            obj_key,
+                            s3,
+                            dst_bucket,
+                            final_key,
+                            transfer_config,
+                        ): (obj_key, final_key)
+                        for obj_key, final_key in transfer_tasks
+                    }
+
+                    for future in concurrent.futures.as_completed(future_to_transfer):
+                        obj_key, final_key = future_to_transfer[future]
+                        try:
+                            future.result()
+                            success_count += 1
+                            console.print(
+                                f"  [green]✓[/green] Streamed {obj_key} -> {final_key}"
+                            )
+                        except Exception as exc:
+                            failure_count += 1
+                            failures.append((obj_key, exc))
+                            console.print(
+                                f"  [red]✗[/red] Failed stream {obj_key}: {exc}"
+                            )
+
+                if failure_count > 0:
+                    console.print(
+                        f"\n[yellow]Cross-cloud copy complete with partial failures: {success_count} succeeded, {failure_count} failed.[/yellow]"
+                    )
+                    for f_file, err in failures[:10]:
+                        console.print(f"  [red]- {f_file}: {err}[/red]")
+                    if len(failures) > 10:
+                        console.print(
+                            f"  [red]... and {len(failures) - 10} more failures.[/red]"
+                        )
+                    return False
+                else:
+                    console.print(
+                        f"[green]Streamed {success_count} files successfully.[/green]"
+                    )
+                    return True
+
+            else:
+                final_key = (
+                    dst_key
+                    if dst_key and not dst_key.endswith("/")
+                    else f"{dst_key}{os.path.basename(src_key)}"
+                )
+                console.print(
+                    f"Streaming 'gs://{src_bucket}/{src_key}' -> 's3://{dst_bucket}/{final_key}'..."
+                )
+
+                tmp = tempfile.NamedTemporaryFile(delete=False)
+                tmp_name = tmp.name
+                tmp.close()
+
+                try:
+                    gcs_bucket = gcs.bucket(src_bucket)
+                    blob = gcs_bucket.blob(src_key)
+                    blob.download_to_filename(tmp_name)
+
+                    kwargs_s3: dict[str, Any] = {}
+                    if transfer_config:
+                        kwargs_s3["Config"] = transfer_config
+
+                    s3.upload_file(tmp_name, dst_bucket, final_key, **kwargs_s3)
+                    console.print("[green]Cross-cloud copy complete.[/green]")
+                    return True
+                finally:
+                    if os.path.exists(tmp_name):
+                        os.remove(tmp_name)
 
         else:
             console.print("[red]Invalid arguments or unsupported copy operation.[/red]")
